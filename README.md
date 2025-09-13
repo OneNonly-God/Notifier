@@ -55,8 +55,8 @@ sudo apt install -y build-essential cmake git pkg-config libglfw3-dev libglm-dev
 The project relies on the **docking** branch of Dear ImGui to use the DockBuilder APIs.
 
 ```bash
-git clone https://github.com/ocornut/imgui.git external/imgui
-cd external/imgui
+git clone https://github.com/ocornut/imgui.git resources/imgui
+cd resources/imgui
 git fetch origin
 git checkout docking
 ```
