@@ -191,8 +191,4 @@ Contributions, PRs, and suggestions are welcome. If you add features, please:
 
   * [Dear ImGui](https://github.com/ocornut/imgui) (docking branch) — MIT-style license
   * [GLFW](https://www.glfw.org/) — zlib/libpng license
-
-Credits: 
-        Safal — original developer and UI designer of Notifier(I also used chatgpt and claude for this LOL!).
-
 ---
