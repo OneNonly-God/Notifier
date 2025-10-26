@@ -15,4 +15,5 @@ cmake ..
 echo ">>> Building project..."
 make -j$(nproc)
 
-echo ">>> Build complete!"
+echo ">>> Build complete! Running the application..."
+./notifier
