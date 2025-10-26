@@ -1,3 +1,4 @@
+// notifier_editor.cpp - Fixed Version
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "backends/imgui_impl_glfw.h"
@@ -12,30 +13,59 @@
 #include <algorithm>
 #include <sstream>
 #include <filesystem>
+#include <memory>
+#include <unordered_map>
+#include <chrono>
+#include <iomanip>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#elif __linux__
+#include <gtk/gtk.h>
+#elif __APPLE__
+// macOS specific headers would go here
+#endif
+
+namespace fs = std::filesystem;
 
 enum ThemeType { THEME_DARK, THEME_LIGHT, THEME_CUSTOM };
 ThemeType currentTheme = THEME_CUSTOM;
-const std::string DELIMITER = "--------------";
-const std::string NOTES_FILE = "notes.txt";
 
-// Application state
+// A single open file / tab representation
+struct FileTab {
+    std::string filePath; // empty => unsaved new file
+    std::string content;  // live editable buffer (std::string)
+    bool isModified = false;
+    std::filesystem::file_time_type lastModified;
+    bool isReadonly = false;
+};
+
 struct AppState {
-    std::vector<std::string> notes;
-    int selectedNote = -1;
+    std::vector<FileTab> tabs;
+    int activeTab = -1;
+    int closeTabIndex = -1;
+
+    // UI & dialog flags
     bool needsSave = false;
     bool showAboutDialog = false;
-    bool showConfirmDelete = false;
-    int noteToDelete = -1;
+    bool showFileDialog = false;
     bool firstRun = true;
-    
-    // Input buffers
-    char inputBuffer[8192] = "";
-    char editBuffer[8192] = "";
+
+    // File browser / UI helpers
+    std::string currentPath;
+    char filePathBuffer[512] = "";
+
+    // Search buffer
     char searchBuffer[256] = "";
-    
-    // UI state
+
+    // UI focus
     bool focusEditor = false;
-    bool focusNewNote = false;
+
+    // Recent files
+    std::vector<std::string> recentFiles;
+    const size_t maxRecentFiles = 10;
 };
 
 AppState g_appState;
@@ -43,92 +73,430 @@ AppState g_appState;
 // Forward declarations
 void SetupCustomStyle();
 void HandleKeyboardShortcuts();
-void LoadNotes();
-void SaveNotes();
 void SetupInitialDockingLayout();
+std::string OpenFileDialog();
+void OpenFile(const std::string& filepath);
+void SaveFileAs(int tabIndex);
+void AddToRecentFiles(const std::string& filepath);
+void LoadRecentFiles();
+void SaveFile(int tabIndex);
+void CloseTab(int tabIndex);
+void RenderTabs();
+void RenderEditor();
+void SaveRecentFiles();
+void SaveAll();
+void RenderMenuBar();
+void RenderMainDockSpace();
+bool IsTextFile(const std::string& filepath);
+std::string ReadFileContent(const std::string& filepath);
 
-// Utility function to get note title
-std::string GetNoteTitle(const std::string& note, size_t maxLength = 30) {
-    if (note.empty()) return "[Empty Note]";
-    
-    std::istringstream stream(note);
-    std::string firstLine;
-    std::getline(stream, firstLine);
-    
-    if (firstLine.empty()) return "[Empty Note]";
-    
-    // Trim whitespace
-    firstLine.erase(0, firstLine.find_first_not_of(" \t\r\n"));
-    firstLine.erase(firstLine.find_last_not_of(" \t\r\n") + 1);
-    
-    if (firstLine.length() > maxLength) {
-        return firstLine.substr(0, maxLength) + "...";
+// -----------------------------
+// ImGui helper: Callback resize - FIXED
+// -----------------------------
+static int ImGuiStringInputCallback(ImGuiInputTextCallbackData* data)
+{
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize)
+    {
+        std::string* str = (std::string*)data->UserData;
+        IM_ASSERT(str != nullptr);
+        
+        // Resize string to accommodate new content
+        str->resize((size_t)data->BufTextLen);
+        
+        // CRITICAL FIX: Use data() instead of c_str() for non-const access
+        data->Buf = str->data();
     }
-    return firstLine;
+    return 0;
 }
 
-void LoadNotes() {
-    g_appState.notes.clear();
-    
-    std::ifstream file(NOTES_FILE);
-    if (!file.is_open()) {
-        std::cout << "Notes file not found. Will create a new one when saving.\n";
-        return;
+// -----------------------------
+// Platform file dialogs
+// -----------------------------
+std::string OpenFileDialog() {
+#ifdef _WIN32
+    char filename[MAX_PATH] = "";
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = "All Files\0*.*\0Text Files\0*.txt\0C++ Files\0*.cpp;*.h;*.hpp\0";
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = "Open File";
+    ofn.Flags = OFN_DONTADDTORECENT | OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileNameA(&ofn)) {
+        return std::string(filename);
+    }
+#elif __linux__
+    // Use GTK file dialog on Linux
+    if (!gtk_init_check(NULL, NULL)) {
+        std::cerr << "GTK init failed\n";
+        return "";
     }
 
-    std::string line, note;
-    while (std::getline(file, line)) {
-        if (line == DELIMITER) {
-            if (!note.empty()) {
-                // Remove trailing newline if present
-                if (!note.empty() && note.back() == '\n') {
-                    note.pop_back();
-                }
-                g_appState.notes.push_back(note);
-                note.clear();
+    GtkWidget *dialog = gtk_file_chooser_dialog_new("Open File",
+                                                    NULL,
+                                                    GTK_FILE_CHOOSER_ACTION_OPEN,
+                                                    "_Cancel", GTK_RESPONSE_CANCEL,
+                                                    "_Open", GTK_RESPONSE_ACCEPT,
+                                                    NULL);
+
+    std::string result;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        result = std::string(filename);
+        g_free(filename);
+    }
+
+    gtk_widget_destroy(dialog);
+    while (gtk_events_pending()) {
+        gtk_main_iteration();
+    }
+
+    return result;
+#else
+    // Fallback: Use ImGui file browser
+    g_appState.showFileDialog = true;
+    return "";
+#endif
+    return "";
+}
+
+std::string SaveFileDialog(const std::string& defaultName = "") {
+#ifdef _WIN32
+    char filename[MAX_PATH] = "";
+    if (!defaultName.empty()) {
+        strncpy(filename, defaultName.c_str(), MAX_PATH - 1);
+        filename[MAX_PATH - 1] = '\0';
+    }
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = "Text Files\0*.txt\0All Files\0*.*\0";
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = "Save File As";
+    ofn.Flags = OFN_OVERWRITEPROMPT;
+    ofn.lpstrDefExt = "txt";
+
+    if (GetSaveFileNameA(&ofn)) {
+        return std::string(filename);
+    }
+#elif __linux__
+    if (!gtk_init_check(NULL, NULL)) {
+        return "";
+    }
+
+    GtkWidget *dialog = gtk_file_chooser_dialog_new("Save File As",
+                                                    NULL,
+                                                    GTK_FILE_CHOOSER_ACTION_SAVE,
+                                                    "_Cancel", GTK_RESPONSE_CANCEL,
+                                                    "_Save", GTK_RESPONSE_ACCEPT,
+                                                    NULL);
+
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
+
+    if (!defaultName.empty()) {
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), defaultName.c_str());
+    }
+
+    std::string result;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        result = std::string(filename);
+        g_free(filename);
+    }
+
+    gtk_widget_destroy(dialog);
+    while (gtk_events_pending()) {
+        gtk_main_iteration();
+    }
+
+    return result;
+#else
+    g_appState.showFileDialog = true;
+    return "";
+#endif
+    return "";
+}
+
+// -----------------------------
+// File helpers - IMPROVED
+// -----------------------------
+bool IsTextFile(const std::string& filepath) {
+    if (filepath.empty() || !fs::exists(filepath)) return false;
+    
+    std::string ext = fs::path(filepath).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    std::vector<std::string> textExtensions = {
+        ".txt", ".md", ".markdown", ".log", ".cfg", ".ini", ".json", ".xml",
+        ".html", ".htm", ".css", ".js", ".ts", ".jsx", ".tsx",
+        ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".py", ".java",
+        ".cs", ".rb", ".go", ".rs", ".swift", ".kt", ".scala",
+        ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
+        ".yaml", ".yml", ".toml", ".env", ".gitignore", ".dockerignore"
+    };
+
+    if (std::find(textExtensions.begin(), textExtensions.end(), ext) != textExtensions.end()) {
+        return true;
+    }
+
+    if (ext.empty()) return true;
+
+    // Binary check
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) return false;
+
+    char buffer[512];
+    file.read(buffer, sizeof(buffer));
+    std::streamsize bytesRead = file.gcount();
+    file.close();
+
+    for (std::streamsize i = 0; i < bytesRead; ++i) {
+        unsigned char c = static_cast<unsigned char>(buffer[i]);
+        // Allow tab, newline, carriage return
+        if (c < 32 && c != 9 && c != 10 && c != 13) {
+            if (c == 0) return false;
+        }
+    }
+
+    return true;
+}
+
+std::string ReadFileContent(const std::string& filepath) {
+    if (filepath.empty() || !fs::exists(filepath)) {
+        std::cerr << "File does not exist: " << filepath << "\n";
+        return "";
+    }
+    
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file: " << filepath << "\n";
+        return "";
+    }
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    const size_t maxSize = 10 * 1024 * 1024; // 10MB
+    if (size > (std::streamsize)maxSize) {
+        std::string content(maxSize, '\0');
+        file.read(&content[0], maxSize);
+        content += "\n\n[File truncated - original size: " + std::to_string(size) + " bytes]";
+        return content;
+    }
+
+    std::string content((size_t)size, '\0');
+    file.read(&content[0], size);
+
+    // Normalize CRLF -> LF
+    std::string normalized;
+    normalized.reserve(content.size());
+    for (size_t i = 0; i < content.size(); ++i) {
+        if (content[i] == '\r') {
+            if (i + 1 < content.size() && content[i + 1] == '\n') {
+                normalized += '\n';
+                ++i;
+            } else {
+                normalized += '\n';
             }
         } else {
-            if (!note.empty()) note += "\n";
-            note += line;
+            normalized += content[i];
         }
     }
-    
-    // Add the last note if it doesn't end with delimiter
-    if (!note.empty()) {
-        if (!note.empty() && note.back() == '\n') {
-            note.pop_back();
-        }
-        g_appState.notes.push_back(note);
-    }
-    
-    file.close();
-    std::cout << "Loaded " << g_appState.notes.size() << " notes from " << NOTES_FILE << "\n";
+
+    return normalized;
 }
 
-void SaveNotes() {
-    std::ofstream file(NOTES_FILE, std::ios::trunc);
+// -----------------------------
+// Recent files - IMPROVED
+// -----------------------------
+void AddToRecentFiles(const std::string& filepath) {
+    if (filepath.empty()) return;
+    
+    auto it = std::find(g_appState.recentFiles.begin(), g_appState.recentFiles.end(), filepath);
+    if (it != g_appState.recentFiles.end()) {
+        g_appState.recentFiles.erase(it);
+    }
+
+    g_appState.recentFiles.insert(g_appState.recentFiles.begin(), filepath);
+
+    if (g_appState.recentFiles.size() > g_appState.maxRecentFiles) {
+        g_appState.recentFiles.resize(g_appState.maxRecentFiles);
+    }
+
+    SaveRecentFiles();
+}
+
+void LoadRecentFiles() {
+    g_appState.recentFiles.clear();
+    std::ifstream file("recent_files.txt");
+    if (!file.is_open()) return;
+
+    std::string line;
+    while (std::getline(file, line) && g_appState.recentFiles.size() < g_appState.maxRecentFiles) {
+        if (!line.empty() && fs::exists(line)) {
+            g_appState.recentFiles.push_back(line);
+        }
+    }
+}
+
+void SaveRecentFiles() {
+    std::ofstream file("recent_files.txt", std::ios::trunc);
     if (!file.is_open()) {
-        std::cerr << "Failed to save notes to " << NOTES_FILE << "\n";
+        std::cerr << "Failed to save recent files\n";
+        return;
+    }
+    for (const auto& path : g_appState.recentFiles) {
+        file << path << "\n";
+    }
+}
+
+// -----------------------------
+// Save/Load tab file operations - IMPROVED
+// -----------------------------
+void SaveFile(int tabIndex) {
+    if (tabIndex < 0 || tabIndex >= (int)g_appState.tabs.size()) {
+        std::cerr << "Invalid tab index: " << tabIndex << "\n";
         return;
     }
     
-    for (size_t i = 0; i < g_appState.notes.size(); ++i) {
-        file << g_appState.notes[i];
-        if (!g_appState.notes[i].empty() && g_appState.notes[i].back() != '\n') {
-            file << "\n";
-        }
-        file << DELIMITER << "\n";
+    FileTab &tab = g_appState.tabs[tabIndex];
+
+    if (tab.filePath.empty()) {
+        SaveFileAs(tabIndex);
+        return;
+    }
+
+    std::ofstream file(tab.filePath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        std::cerr << "Failed to save file: " << tab.filePath << "\n";
+        return;
+    }
+
+    file << tab.content;
+    file.close();
+
+    tab.isModified = false;
+    g_appState.needsSave = false;
+    
+    if (fs::exists(tab.filePath)) {
+        tab.lastModified = fs::last_write_time(tab.filePath);
     }
     
-    file.close();
-    std::cout << "Saved " << g_appState.notes.size() << " notes to " << NOTES_FILE << "\n";
-    g_appState.needsSave = false;
+    AddToRecentFiles(tab.filePath);
+    std::cout << "Saved: " << tab.filePath << "\n";
 }
 
+void SaveFileAs(int tabIndex) {
+    if (tabIndex < 0 || tabIndex >= (int)g_appState.tabs.size()) return;
+
+    std::string defaultName = "untitled.txt";
+    if (!g_appState.tabs[tabIndex].filePath.empty()) {
+        defaultName = fs::path(g_appState.tabs[tabIndex].filePath).filename().string();
+    }
+
+    std::string filepath = SaveFileDialog(defaultName);
+    if (filepath.empty()) return;
+
+    std::ofstream file(filepath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        std::cerr << "Failed to Save As: " << filepath << "\n";
+        return;
+    }
+
+    file << g_appState.tabs[tabIndex].content;
+    file.close();
+
+    g_appState.tabs[tabIndex].filePath = filepath;
+    g_appState.tabs[tabIndex].isModified = false;
+    g_appState.needsSave = false;
+    
+    if (fs::exists(filepath)) {
+        g_appState.tabs[tabIndex].lastModified = fs::last_write_time(filepath);
+    }
+    
+    AddToRecentFiles(filepath);
+    std::cout << "Saved As: " << filepath << "\n";
+}
+
+void SaveAll() {
+    for (int i = 0; i < (int)g_appState.tabs.size(); ++i) {
+        if (g_appState.tabs[i].isModified) {
+            SaveFile(i);
+        }
+    }
+}
+
+// -----------------------------
+// Tab and editor management - IMPROVED
+// -----------------------------
+void OpenFile(const std::string& filepath) {
+    if (filepath.empty()) return;
+    
+    if (!fs::exists(filepath)) {
+        std::cerr << "File does not exist: " << filepath << "\n";
+        return;
+    }
+
+    // Check if file is already open
+    for (int i = 0; i < (int)g_appState.tabs.size(); ++i) {
+        if (g_appState.tabs[i].filePath == filepath) {
+            g_appState.activeTab = i;
+            g_appState.focusEditor = true;
+            return;
+        }
+    }
+
+    std::string content = ReadFileContent(filepath);
+    if (content.empty() && fs::file_size(filepath) > 0) {
+        content = "[Binary file: " + filepath + "]\n[Size: " + std::to_string(fs::file_size(filepath)) + " bytes]\n\nThis file appears to be binary and cannot be displayed as text.";
+    }
+
+    FileTab tab;
+    tab.filePath = filepath;
+    tab.content = content;
+    tab.lastModified = fs::last_write_time(filepath);
+    tab.isReadonly = false;
+    tab.isModified = false;
+
+    g_appState.tabs.push_back(std::move(tab));
+    g_appState.activeTab = (int)g_appState.tabs.size() - 1;
+
+    AddToRecentFiles(filepath);
+    g_appState.focusEditor = true;
+}
+
+void CloseTab(int tabIndex) {
+    if (tabIndex < 0 || tabIndex >= (int)g_appState.tabs.size()) return;
+
+    g_appState.tabs.erase(g_appState.tabs.begin() + tabIndex);
+    
+    if (g_appState.tabs.empty()) {
+        g_appState.activeTab = -1;
+        g_appState.needsSave = false;
+    } else {
+        g_appState.activeTab = std::min<int>(tabIndex, (int)g_appState.tabs.size() - 1);
+        
+        // Update needsSave flag
+        g_appState.needsSave = false;
+        for (const auto& tab : g_appState.tabs) {
+            if (tab.isModified) {
+                g_appState.needsSave = true;
+                break;
+            }
+        }
+    }
+}
+
+// -----------------------------
+// UI: style, docking, menu
+// -----------------------------
 void SetupCustomStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
-    
-    // Spacing and sizing
+
     style.WindowRounding = 8.0f;
     style.FrameRounding = 4.0f;
     style.ScrollbarRounding = 6.0f;
@@ -137,7 +505,7 @@ void SetupCustomStyle() {
     style.WindowBorderSize = 1.0f;
     style.FrameBorderSize = 0.0f;
     style.PopupBorderSize = 1.0f;
-    
+
     style.FramePadding = ImVec2(8, 4);
     style.ItemSpacing = ImVec2(8, 6);
     style.ItemInnerSpacing = ImVec2(6, 4);
@@ -145,7 +513,6 @@ void SetupCustomStyle() {
     style.ScrollbarSize = 16.0f;
     style.GrabMinSize = 12.0f;
 
-    // Custom color scheme
     ImVec4* colors = style.Colors;
     colors[ImGuiCol_Text]                = ImVec4(0.92f, 0.92f, 0.94f, 1.0f);
     colors[ImGuiCol_TextDisabled]        = ImVec4(0.44f, 0.44f, 0.47f, 1.0f);
@@ -174,104 +541,91 @@ void SetupCustomStyle() {
     colors[ImGuiCol_Header]              = ImVec4(0.2f, 0.3f, 0.6f, 0.8f);
     colors[ImGuiCol_HeaderHovered]       = ImVec4(0.3f, 0.4f, 0.7f, 1.0f);
     colors[ImGuiCol_HeaderActive]        = ImVec4(0.4f, 0.5f, 0.8f, 1.0f);
-    colors[ImGuiCol_Separator]           = ImVec4(0.25f, 0.25f, 0.29f, 1.0f);
-    colors[ImGuiCol_SeparatorHovered]    = ImVec4(0.35f, 0.35f, 0.39f, 1.0f);
-    colors[ImGuiCol_SeparatorActive]     = ImVec4(0.45f, 0.45f, 0.49f, 1.0f);
-    colors[ImGuiCol_ResizeGrip]          = ImVec4(0.25f, 0.25f, 0.29f, 0.3f);
-    colors[ImGuiCol_ResizeGripHovered]   = ImVec4(0.35f, 0.35f, 0.39f, 0.6f);
-    colors[ImGuiCol_ResizeGripActive]    = ImVec4(0.45f, 0.45f, 0.49f, 0.9f);
-    colors[ImGuiCol_Tab]                 = ImVec4(0.12f, 0.12f, 0.14f, 1.0f);
-    colors[ImGuiCol_TabHovered]          = ImVec4(0.25f, 0.25f, 0.29f, 1.0f);
-    colors[ImGuiCol_TabActive]           = ImVec4(0.18f, 0.18f, 0.21f, 1.0f);
-    colors[ImGuiCol_TabUnfocused]        = ImVec4(0.08f, 0.08f, 0.10f, 1.0f);
-    colors[ImGuiCol_TabUnfocusedActive]  = ImVec4(0.12f, 0.12f, 0.14f, 1.0f);
-    colors[ImGuiCol_DockingPreview]      = ImVec4(0.3f, 0.5f, 0.8f, 0.7f);
-    colors[ImGuiCol_DockingEmptyBg]      = ImVec4(0.05f, 0.05f, 0.07f, 1.0f);
-    colors[ImGuiCol_PlotLines]           = ImVec4(0.61f, 0.61f, 0.64f, 1.0f);
-    colors[ImGuiCol_PlotLinesHovered]    = ImVec4(1.00f, 0.43f, 0.35f, 1.0f);
-    colors[ImGuiCol_PlotHistogram]       = ImVec4(0.90f, 0.70f, 0.00f, 1.0f);
-    colors[ImGuiCol_PlotHistogramHovered]= ImVec4(1.00f, 0.60f, 0.00f, 1.0f);
-    colors[ImGuiCol_TextSelectedBg]      = ImVec4(0.26f, 0.59f, 0.98f, 0.35f);
-    colors[ImGuiCol_DragDropTarget]      = ImVec4(1.00f, 1.00f, 0.00f, 0.90f);
-    colors[ImGuiCol_NavHighlight]        = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
-    colors[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
-    colors[ImGuiCol_NavWindowingDimBg]   = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
-    colors[ImGuiCol_ModalWindowDimBg]    = ImVec4(0.80f, 0.80f, 0.80f, 0.35f);
+    colors[ImGuiCol_ModalWindowDimBg]    = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
 }
 
+// -----------------------------
+// Keyboard shortcuts - IMPROVED
+// -----------------------------
 void HandleKeyboardShortcuts() {
     ImGuiIO& io = ImGui::GetIO();
-    
-    // Only process shortcuts when no input widget is active
-    if (!io.WantTextInput) {
-        // Ctrl+N - New Note
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N)) {
-            g_appState.notes.push_back("");
-            g_appState.selectedNote = g_appState.notes.size() - 1;
-            g_appState.editBuffer[0] = '\0';
-            g_appState.needsSave = true;
-            g_appState.focusEditor = true;
-        }
-        
-        // Ctrl+S - Save
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
-            if (g_appState.needsSave) {
-                SaveNotes();
+
+    // Only process shortcuts when not typing in text fields
+    if (io.WantTextInput) return;
+
+    // Ctrl+O - Open
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+        std::string filepath = OpenFileDialog();
+        if (!filepath.empty()) OpenFile(filepath);
+    }
+
+    // Ctrl+N - New file / tab
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+        FileTab t;
+        t.filePath = "";
+        t.content = "";
+        t.isModified = false;
+        g_appState.tabs.push_back(std::move(t));
+        g_appState.activeTab = (int)g_appState.tabs.size() - 1;
+        g_appState.focusEditor = true;
+    }
+
+    // Ctrl+S - Save active
+    if (io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        if (g_appState.activeTab >= 0) SaveFile(g_appState.activeTab);
+    }
+
+    // Ctrl+Shift+S - Save As
+    if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        if (g_appState.activeTab >= 0) SaveFileAs(g_appState.activeTab);
+    }
+
+    // Ctrl+W - Close active tab
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_W, false)) {
+        if (g_appState.activeTab >= 0) {
+            if (g_appState.tabs[g_appState.activeTab].isModified) {
+                g_appState.closeTabIndex = g_appState.activeTab;
+            } else {
+                CloseTab(g_appState.activeTab);
             }
         }
-        
-        // F5 - Reload
-        if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
-            LoadNotes();
-            g_appState.selectedNote = -1;
-            g_appState.needsSave = false;
-        }
-        
-        // Delete key - Delete selected note (with confirmation)
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && g_appState.selectedNote >= 0) {
-            g_appState.showConfirmDelete = true;
-            g_appState.noteToDelete = g_appState.selectedNote;
-        }
-        
-        // Escape - Clear search or deselect note
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            if (g_appState.searchBuffer[0] != '\0') {
-                g_appState.searchBuffer[0] = '\0';
-            } else if (g_appState.selectedNote >= 0) {
-                g_appState.selectedNote = -1;
-                g_appState.editBuffer[0] = '\0';
-            }
+    }
+
+    // F5 - Reload recent files
+    if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
+        LoadRecentFiles();
+    }
+
+    // Esc - Clear search or deselect
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        if (g_appState.searchBuffer[0] != '\0') {
+            g_appState.searchBuffer[0] = '\0';
         }
     }
 }
 
+// -----------------------------
+// Docking layout & main dockspace
+// -----------------------------
 void SetupInitialDockingLayout() {
     ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
-    
-    // Only setup if no existing layout
+
     if (ImGui::DockBuilderGetNode(dockspace_id) == nullptr) {
-        // Clear any existing layout
         ImGui::DockBuilderRemoveNode(dockspace_id);
         ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->WorkSize);
 
-        ImGuiID dock_left, dock_right, dock_bottom;
-        
-        // Split the dock space
-        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.25f, &dock_left, &dock_right);
-        ImGui::DockBuilderSplitNode(dock_right, ImGuiDir_Down, 0.30f, &dock_bottom, &dock_right);
+        ImGuiID dock_left, dock_right;
+        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.20f, &dock_left, &dock_right);
 
-        // Dock windows
-        ImGui::DockBuilderDockWindow("Notes List", dock_left);
+        ImGui::DockBuilderDockWindow("Files", dock_left);
         ImGui::DockBuilderDockWindow("Editor", dock_right);
-        ImGui::DockBuilderDockWindow("New Note", dock_bottom);
 
         ImGui::DockBuilderFinish(dockspace_id);
     }
 }
 
 void RenderMainDockSpace() {
-    // Main viewport dockspace
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -285,14 +639,13 @@ void RenderMainDockSpace() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    
+
     ImGui::Begin("MainDockSpace", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
     ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
-    
-    // Setup layout on first run
+
     if (g_appState.firstRun) {
         SetupInitialDockingLayout();
         g_appState.firstRun = false;
@@ -301,40 +654,56 @@ void RenderMainDockSpace() {
     ImGui::End();
 }
 
+// -----------------------------
+// Menu bar
+// -----------------------------
 void RenderMenuBar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("New Note", "Ctrl+N")) {
-                g_appState.notes.push_back("");
-                g_appState.selectedNote = g_appState.notes.size() - 1;
-                g_appState.editBuffer[0] = '\0';
-                g_appState.needsSave = true;
+            if (ImGui::MenuItem("Open File", "Ctrl+O")) {
+                std::string path = OpenFileDialog();
+                if (!path.empty()) OpenFile(path);
+            }
+
+            if (ImGui::BeginMenu("Recent Files", !g_appState.recentFiles.empty())) {
+                for (const auto& filepath : g_appState.recentFiles) {
+                    std::string filename = fs::path(filepath).filename().string();
+                    if (ImGui::MenuItem(filename.c_str())) {
+                        OpenFile(filepath);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", filepath.c_str());
+                    }
+                }
+                ImGui::EndMenu();
+            }
+
+            ImGui::Separator();
+            if (ImGui::MenuItem("New File", "Ctrl+N")) {
+                FileTab t;
+                t.filePath = "";
+                t.content = "";
+                t.isModified = false;
+                g_appState.tabs.push_back(std::move(t));
+                g_appState.activeTab = (int)g_appState.tabs.size() - 1;
                 g_appState.focusEditor = true;
             }
-            if (ImGui::MenuItem("Save All", "Ctrl+S", false, g_appState.needsSave)) {
-                SaveNotes();
+
+            if (ImGui::MenuItem("Save", "Ctrl+S", false, g_appState.activeTab >= 0)) {
+                if (g_appState.activeTab >= 0) SaveFile(g_appState.activeTab);
             }
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, g_appState.activeTab >= 0)) {
+                if (g_appState.activeTab >= 0) SaveFileAs(g_appState.activeTab);
+            }
+            if (ImGui::MenuItem("Save All")) {
+                SaveAll();
+            }
+
             ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) {
-                if (g_appState.needsSave) {
-                    SaveNotes();
-                }
                 glfwSetWindowShouldClose(glfwGetCurrentContext(), GLFW_TRUE);
             }
-            ImGui::EndMenu();
-        }
 
-        if (ImGui::BeginMenu("Edit")) {
-            if (ImGui::MenuItem("Delete Note", "Del", false, g_appState.selectedNote >= 0)) {
-                g_appState.showConfirmDelete = true;
-                g_appState.noteToDelete = g_appState.selectedNote;
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Reload Notes", "F5")) {
-                LoadNotes();
-                g_appState.selectedNote = -1;
-                g_appState.needsSave = false;
-            }
             ImGui::EndMenu();
         }
 
@@ -364,7 +733,6 @@ void RenderMenuBar() {
             ImGui::EndMenu();
         }
 
-        // Right side of menu bar - save indicator
         if (g_appState.needsSave) {
             ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 160);
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), "[Unsaved Changes]");
@@ -374,222 +742,281 @@ void RenderMenuBar() {
     }
 }
 
-void RenderNotesList() {
-    ImGui::Begin("Notes List");
-    
-    // Search bar
-    ImGui::PushItemWidth(-1);
-    ImGui::InputTextWithHint("##search", "Search notes...", g_appState.searchBuffer, IM_ARRAYSIZE(g_appState.searchBuffer));
-    ImGui::PopItemWidth();
-    ImGui::Separator();
-    
-    // Display notes
-    ImGuiListClipper clipper;
-    std::vector<int> filteredIndices;
-    
-    // Filter notes based on search
-    for (int i = 0; i < (int)g_appState.notes.size(); i++) {
-        if (g_appState.searchBuffer[0] == '\0') {
-            filteredIndices.push_back(i);
-        } else {
-            std::string title = GetNoteTitle(g_appState.notes[i]);
-            std::string searchLower(g_appState.searchBuffer);
-            std::string titleLower = title;
-            std::string contentLower = g_appState.notes[i];
+// -----------------------------
+// Tabs view (files list) - IMPROVED
+// -----------------------------
+void RenderTabs() {
+    ImGui::Begin("Files");
+
+    if (!g_appState.tabs.empty()) {
+        ImGui::Text("Open Files:");
+        ImGui::Separator();
+        
+        for (int i = 0; i < (int)g_appState.tabs.size(); ++i) {
+            FileTab &tab = g_appState.tabs[i];
+            std::string title = tab.filePath.empty() 
+                ? ("Untitled " + std::to_string(i + 1)) 
+                : fs::path(tab.filePath).filename().string();
             
-            // Convert to lowercase for case-insensitive search
-            std::transform(searchLower.begin(), searchLower.end(), searchLower.begin(), ::tolower);
-            std::transform(titleLower.begin(), titleLower.end(), titleLower.begin(), ::tolower);
-            std::transform(contentLower.begin(), contentLower.end(), contentLower.begin(), ::tolower);
+            if (tab.isModified) title = "• " + title;
+
+            ImGui::PushID(i);
             
-            if (titleLower.find(searchLower) != std::string::npos || 
-                contentLower.find(searchLower) != std::string::npos) {
-                filteredIndices.push_back(i);
+            bool isActive = (g_appState.activeTab == i);
+            if (isActive) {
+                ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.3f, 0.5f, 0.8f, 0.8f));
             }
-        }
-    }
-    
-    // Use clipper for performance with large lists
-    clipper.Begin(filteredIndices.size());
-    while (clipper.Step()) {
-        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-            int noteIndex = filteredIndices[row];
-            std::string title = GetNoteTitle(g_appState.notes[noteIndex]);
             
-            char label[300];
-            snprintf(label, sizeof(label), "%d. %s", noteIndex + 1, title.c_str());
-            
-            if (ImGui::Selectable(label, g_appState.selectedNote == noteIndex)) {
-                g_appState.selectedNote = noteIndex;
-                // Copy note content to edit buffer
-                strncpy(g_appState.editBuffer, g_appState.notes[g_appState.selectedNote].c_str(), sizeof(g_appState.editBuffer) - 1);
-                g_appState.editBuffer[sizeof(g_appState.editBuffer) - 1] = '\0';
+            if (ImGui::Selectable(title.c_str(), isActive)) {
+                g_appState.activeTab = i;
                 g_appState.focusEditor = true;
+            }
+            
+            if (isActive) {
+                ImGui::PopStyleColor();
             }
             
             // Context menu
             if (ImGui::BeginPopupContextItem()) {
-                if (ImGui::MenuItem("Delete")) {
-                    g_appState.showConfirmDelete = true;
-                    g_appState.noteToDelete = noteIndex;
+                if (ImGui::MenuItem("Close")) {
+                    if (tab.isModified) {
+                        g_appState.closeTabIndex = i;
+                    } else {
+                        CloseTab(i);
+                    }
                 }
-                if (ImGui::MenuItem("Duplicate")) {
-                    g_appState.notes.insert(g_appState.notes.begin() + noteIndex + 1, g_appState.notes[noteIndex]);
-                    g_appState.needsSave = true;
+                if (ImGui::MenuItem("Save", nullptr, false, tab.isModified)) {
+                    SaveFile(i);
                 }
                 ImGui::EndPopup();
             }
+
+            ImGui::PopID();
         }
+    } else {
+        ImGui::TextWrapped("No files open. Use File → Open or create a new file.");
     }
-    
-    ImGui::Separator();
-    ImGui::Text("Total: %zu notes", g_appState.notes.size());
-    if (g_appState.searchBuffer[0] != '\0') {
-        ImGui::Text("Filtered: %zu notes", filteredIndices.size());
-    }
-    
+
     ImGui::End();
 }
 
+// -----------------------------
+// Editor panel - FIXED
+// -----------------------------
 void RenderEditor() {
     ImGui::Begin("Editor");
-    
-    if (g_appState.selectedNote >= 0 && g_appState.selectedNote < (int)g_appState.notes.size()) {
-        ImGui::Text("Editing Note #%d", g_appState.selectedNote + 1);
+
+    if (g_appState.activeTab >= 0 && g_appState.activeTab < (int)g_appState.tabs.size()) {
+        FileTab &tab = g_appState.tabs[g_appState.activeTab];
+
+        std::string noteInfo = tab.filePath.empty() 
+            ? ("Untitled - Tab " + std::to_string(g_appState.activeTab + 1))
+            : fs::path(tab.filePath).filename().string();
+        
+        if (tab.isModified) noteInfo += " (modified)";
+        ImGui::Text("%s", noteInfo.c_str());
         ImGui::Separator();
-        
-        // Calculate available space for text editor
+
         ImVec2 availSize = ImGui::GetContentRegionAvail();
-        availSize.y -= 80; // Leave room for buttons and status
-        
-        // Focus the editor if requested
+        availSize.y -= 80;
+
         if (g_appState.focusEditor) {
             ImGui::SetKeyboardFocusHere();
             g_appState.focusEditor = false;
         }
-        
-        // Text editor
-        if (ImGui::InputTextMultiline("##editor", g_appState.editBuffer, IM_ARRAYSIZE(g_appState.editBuffer),
-                                      availSize, ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_CtrlEnterForNewLine)) {
-            g_appState.notes[g_appState.selectedNote] = g_appState.editBuffer;
+
+        // CRITICAL FIX: Ensure string has capacity for editing
+        // Reserve extra space for the buffer
+        const size_t minCapacity = 1024;
+        if (tab.content.capacity() < minCapacity) {
+            tab.content.reserve(minCapacity);
+        }
+
+        ImGuiInputTextFlags flags = 
+            ImGuiInputTextFlags_AllowTabInput | 
+            ImGuiInputTextFlags_CallbackResize;
+
+        // CRITICAL FIX: Use data() instead of c_str() for mutable access
+        // The buffer size should be current size + extra room
+        if (ImGui::InputTextMultiline(
+                "##editor",
+                tab.content.data(),
+                tab.content.capacity() + 1,
+                availSize,
+                flags,
+                ImGuiStringInputCallback,
+                (void*)&tab.content))
+        {
+            tab.isModified = true;
             g_appState.needsSave = true;
         }
-        
+
         ImGui::Separator();
-        
-        // Editor buttons
+
         if (ImGui::Button("Save", ImVec2(100, 0))) {
-            SaveNotes();
+            SaveFile(g_appState.activeTab);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save As", ImVec2(100, 0))) {
+            SaveFileAs(g_appState.activeTab);
         }
         ImGui::SameLine();
         if (ImGui::Button("Revert", ImVec2(100, 0))) {
-            strncpy(g_appState.editBuffer, g_appState.notes[g_appState.selectedNote].c_str(), sizeof(g_appState.editBuffer) - 1);
-            g_appState.editBuffer[sizeof(g_appState.editBuffer) - 1] = '\0';
+            if (!tab.filePath.empty() && fs::exists(tab.filePath)) {
+                tab.content = ReadFileContent(tab.filePath);
+                tab.lastModified = fs::last_write_time(tab.filePath);
+                tab.isModified = false;
+            } else {
+                tab.content.clear();
+                tab.isModified = false;
+            }
         }
-        
-        // Statistics
+
         ImGui::SameLine();
+        
+        // IMPROVED: Better stats calculation
+        size_t charCount = tab.content.length();
         int wordCount = 0;
-        int charCount = strlen(g_appState.editBuffer);
         bool inWord = false;
-        for (int i = 0; i < charCount; i++) {
-            if (isspace(static_cast<unsigned char>(g_appState.editBuffer[i]))) {
+        
+        for (char c : tab.content) {
+            if (std::isspace(static_cast<unsigned char>(c))) {
                 inWord = false;
             } else if (!inWord) {
                 inWord = true;
-                wordCount++;
+                ++wordCount;
             }
         }
-        ImGui::Text("Words: %d | Characters: %d", wordCount, charCount);
-        
+
+        ImGui::Text("Words: %d | Characters: %zu", wordCount, charCount);
+
     } else {
-        // No note selected
         ImVec2 windowSize = ImGui::GetWindowSize();
-        ImVec2 textSize = ImGui::CalcTextSize("Select a note to edit or create a new one");
+        ImVec2 textSize = ImGui::CalcTextSize("Open a file or create a new file");
         ImGui::SetCursorPos(ImVec2((windowSize.x - textSize.x) * 0.5f, windowSize.y * 0.4f));
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Select a note to edit or create a new one");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Open a file or create a new file");
         
-        ImGui::SetCursorPos(ImVec2((windowSize.x - 120) * 0.5f, windowSize.y * 0.5f));
-        if (ImGui::Button("Create New Note", ImVec2(140, 0))) {
-            g_appState.notes.push_back("");
-            g_appState.selectedNote = g_appState.notes.size() - 1;
-            g_appState.editBuffer[0] = '\0';
-            g_appState.needsSave = true;
+        ImGui::SetCursorPos(ImVec2((windowSize.x - 300) * 0.5f, windowSize.y * 0.5f));
+        if (ImGui::Button("New File", ImVec2(140, 0))) {
+            FileTab t;
+            t.filePath = "";
+            t.content = "";
+            t.isModified = false;
+            g_appState.tabs.push_back(std::move(t));
+            g_appState.activeTab = (int)g_appState.tabs.size() - 1;
             g_appState.focusEditor = true;
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Open File", ImVec2(140, 0))) {
+            std::string path = OpenFileDialog();
+            if (!path.empty()) OpenFile(path);
+        }
     }
-    
+
     ImGui::End();
 }
 
-void RenderNewNotePanel() {
-    ImGui::Begin("New Note");
-    ImGui::Text("Create a new note:");
-    ImGui::Separator();
+// -----------------------------
+// Simple ImGui file browser (fallback)
+// -----------------------------
+void RenderSimpleFileBrowser() {
+    if (!g_appState.showFileDialog) return;
+
+    ImGui::OpenPopup("File Browser");
+    ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
     
-    ImVec2 availSize = ImGui::GetContentRegionAvail();
-    availSize.y -= 35;
-    
-    // Focus new note input if requested
-    if (g_appState.focusNewNote) {
-        ImGui::SetKeyboardFocusHere();
-        g_appState.focusNewNote = false;
+    if (ImGui::BeginPopupModal("File Browser", &g_appState.showFileDialog)) {
+        if (g_appState.currentPath.empty()) {
+            g_appState.currentPath = fs::current_path().string();
+        }
+
+        ImGui::Text("Current Path: %s", g_appState.currentPath.c_str());
+        ImGui::SameLine();
+        if (ImGui::Button("Up")) {
+            fs::path parent = fs::path(g_appState.currentPath).parent_path();
+            if (!parent.empty()) {
+                g_appState.currentPath = parent.string();
+            }
+        }
+
+        ImGui::Separator();
+
+        ImGui::BeginChild("FileList", ImVec2(0, -60));
+        try {
+            for (const auto& entry : fs::directory_iterator(g_appState.currentPath)) {
+                std::string name = entry.path().filename().string();
+                if (entry.is_directory()) {
+                    if (ImGui::Selectable(("[DIR] " + name).c_str())) {
+                        g_appState.currentPath = entry.path().string();
+                    }
+                } else {
+                    if (ImGui::Selectable(name.c_str())) {
+                        strncpy(g_appState.filePathBuffer, entry.path().string().c_str(), 
+                               sizeof(g_appState.filePathBuffer) - 1);
+                        g_appState.filePathBuffer[sizeof(g_appState.filePathBuffer) - 1] = '\0';
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            ImGui::Text("Error reading directory: %s", e.what());
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        ImGui::InputText("File", g_appState.filePathBuffer, sizeof(g_appState.filePathBuffer));
+
+        if (ImGui::Button("Open")) {
+            if (strlen(g_appState.filePathBuffer) > 0) {
+                OpenFile(g_appState.filePathBuffer);
+                g_appState.showFileDialog = false;
+                g_appState.filePathBuffer[0] = '\0';
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            g_appState.showFileDialog = false;
+            g_appState.filePathBuffer[0] = '\0';
+        }
+
+        ImGui::EndPopup();
     }
-    
-    ImGui::InputTextMultiline("##newnote", g_appState.inputBuffer, IM_ARRAYSIZE(g_appState.inputBuffer),
-                              availSize, ImGuiInputTextFlags_AllowTabInput);
-    
-    if (ImGui::Button("Add Note", ImVec2(120, 0)) && g_appState.inputBuffer[0] != '\0') {
-        g_appState.notes.push_back(g_appState.inputBuffer);
-        g_appState.inputBuffer[0] = '\0';
-        g_appState.selectedNote = g_appState.notes.size() - 1;
-        strncpy(g_appState.editBuffer, g_appState.notes[g_appState.selectedNote].c_str(), sizeof(g_appState.editBuffer) - 1);
-        g_appState.editBuffer[sizeof(g_appState.editBuffer) - 1] = '\0';
-        g_appState.needsSave = true;
-        g_appState.focusEditor = true;
-    }
-    
-    ImGui::SameLine();
-    if (ImGui::Button("Clear", ImVec2(120, 0))) {
-        g_appState.inputBuffer[0] = '\0';
-    }
-    
-    ImGui::End();
 }
 
+// -----------------------------
+// Dialogs - IMPROVED
+// -----------------------------
 void RenderDialogs() {
-    // Delete confirmation dialog
-    if (g_appState.showConfirmDelete) {
-        ImGui::OpenPopup("Delete Note?");
-        g_appState.showConfirmDelete = false;
+    // Close tab confirmation
+    if (g_appState.closeTabIndex >= 0) {
+        ImGui::OpenPopup("Unsaved Changes");
     }
-    
-    if (ImGui::BeginPopupModal("Delete Note?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Are you sure you want to delete this note?");
-        ImGui::Text("This action cannot be undone.");
+
+    if (ImGui::BeginPopupModal("Unsaved Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("This file has unsaved changes.");
+        ImGui::Text("Do you want to save before closing?");
         ImGui::Separator();
         
-        if (ImGui::Button("Yes, Delete", ImVec2(120, 0))) {
-            if (g_appState.noteToDelete >= 0 && g_appState.noteToDelete < (int)g_appState.notes.size()) {
-                g_appState.notes.erase(g_appState.notes.begin() + g_appState.noteToDelete);
-                if (g_appState.selectedNote >= (int)g_appState.notes.size()) {
-                    g_appState.selectedNote = g_appState.notes.empty() ? -1 : g_appState.notes.size() - 1;
-                }
-                if (g_appState.selectedNote >= 0 && g_appState.selectedNote < (int)g_appState.notes.size()) {
-                    strncpy(g_appState.editBuffer, g_appState.notes[g_appState.selectedNote].c_str(), sizeof(g_appState.editBuffer) - 1);
-                    g_appState.editBuffer[sizeof(g_appState.editBuffer) - 1] = '\0';
-                } else {
-                    g_appState.editBuffer[0] = '\0';
-                }
-                g_appState.needsSave = true;
+        if (ImGui::Button("Save", ImVec2(120, 0))) {
+            if (g_appState.closeTabIndex >= 0 && g_appState.closeTabIndex < (int)g_appState.tabs.size()) {
+                SaveFile(g_appState.closeTabIndex);
+                CloseTab(g_appState.closeTabIndex);
             }
-            g_appState.noteToDelete = -1;
+            g_appState.closeTabIndex = -1;
             ImGui::CloseCurrentPopup();
         }
-        
         ImGui::SameLine();
+        
+        if (ImGui::Button("Don't Save", ImVec2(120, 0))) {
+            if (g_appState.closeTabIndex >= 0 && g_appState.closeTabIndex < (int)g_appState.tabs.size()) {
+                CloseTab(g_appState.closeTabIndex);
+            }
+            g_appState.closeTabIndex = -1;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        
         if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-            g_appState.noteToDelete = -1;
+            g_appState.closeTabIndex = -1;
             ImGui::CloseCurrentPopup();
         }
         
@@ -601,17 +1028,21 @@ void RenderDialogs() {
         ImGui::OpenPopup("About Notifier");
         g_appState.showAboutDialog = false;
     }
-    
+
     if (ImGui::BeginPopupModal("About Notifier", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Notifier - A Simple Notes Application");
+        ImGui::Text("Notifier - File Editor");
         ImGui::Separator();
-        ImGui::Text("Version: 1.0 - Beta Edition");
+
+        ImGui::Text("Version: 1.0.1 (Fixed)");
         ImGui::Text("Built with C++ and Dear ImGui");
         ImGui::Separator();
         
         ImGui::Text("Features:");
-        ImGui::BulletText("Create, edit, and delete notes");
-        ImGui::BulletText("Fast search through notes");
+        ImGui::BulletText("Open and edit any file type");
+        ImGui::BulletText("Smart file type detection");
+        ImGui::BulletText("Recent files history");
+        ImGui::BulletText("Multiple file tabs");
+        ImGui::BulletText("Fast search through files");
         ImGui::BulletText("Keyboard shortcuts");
         ImGui::BulletText("Auto-save indicator");
         ImGui::BulletText("Multiple themes");
@@ -619,11 +1050,12 @@ void RenderDialogs() {
         
         ImGui::Separator();
         ImGui::Text("Keyboard Shortcuts:");
-        ImGui::BulletText("Ctrl+N: New note");
-        ImGui::BulletText("Ctrl+S: Save all");
-        ImGui::BulletText("F5: Reload notes");
-        ImGui::BulletText("Del: Delete selected note");
-        ImGui::BulletText("Esc: Clear search/deselect");
+        ImGui::BulletText("Ctrl+O: Open file");
+        ImGui::BulletText("Ctrl+N: New file");
+        ImGui::BulletText("Ctrl+S: Save");
+        ImGui::BulletText("Ctrl+Shift+S: Save as");
+        ImGui::BulletText("Ctrl+W: Close tab");
+        ImGui::BulletText("F5: Reload recent files");
         
         ImGui::Separator();
         if (ImGui::Button("Close", ImVec2(120, 0))) {
@@ -632,10 +1064,15 @@ void RenderDialogs() {
         
         ImGui::EndPopup();
     }
+
+    // Fallback file browser
+    RenderSimpleFileBrowser();
 }
 
+// -----------------------------
+// main
+// -----------------------------
 int main() {
-    // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW\n";
         return -1;
@@ -644,100 +1081,81 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    
-    // Create window
-    GLFWwindow* window = glfwCreateWindow(1400, 900, "Notifier - Enhanced Notes Application", nullptr, nullptr);
+
+    GLFWwindow* window = glfwCreateWindow(1400, 900, "Notifier - File Editor", nullptr, nullptr);
     if (!window) {
         std::cerr << "Failed to create GLFW window\n";
         glfwTerminate();
         return -1;
     }
-    
-    glfwMakeContextCurrent(window);
 
-    // Initialize ImGui
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1); // Enable vsync
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    
-    // Enable docking and viewports
+
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
-    
-    // Setup font (with fallback)
+
+    // Load fonts
     ImFont* defaultFont = io.Fonts->AddFontDefault();
-    
+
     const char* fontPaths[] = {
-        //I have a fonts folder and might add more fonts in future, this only works for linux rn :P
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     };
-    
+
     ImFont* mainFont = nullptr;
-    for (const char* fontPath : fontPaths) {
-        if (std::filesystem::exists(fontPath)) {
-            mainFont = io.Fonts->AddFontFromFileTTF(fontPath, 16.0f);
-            if (mainFont) {
-                io.FontDefault = mainFont;
-                break;
+    for (const char* fp : fontPaths) {
+        if (fs::exists(fp)) {
+            mainFont = io.Fonts->AddFontFromFileTTF(fp, 16.0f);
+            if (mainFont) { 
+                io.FontDefault = mainFont; 
+                break; 
             }
         }
     }
-    
-    // Setup style
+
     SetupCustomStyle();
-    
-    // Adjust style for viewports
     ImGuiStyle& style = ImGui::GetStyle();
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         style.WindowRounding = 0.0f;
         style.Colors[ImGuiCol_WindowBg].w = 1.0f;
     }
 
-    // Initialize backends
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
-    // Load notes
-    LoadNotes();
+    LoadRecentFiles();
 
     // Main loop
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        // Start ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // Handle keyboard shortcuts
         HandleKeyboardShortcuts();
 
-        // Render main dockspace
         RenderMainDockSpace();
-        
-        // Render menu bar
         RenderMenuBar();
-
-        // Render main windows
-        RenderNotesList();
+        RenderTabs();
         RenderEditor();
-        RenderNewNotePanel();
-        
-        // Render dialogs
         RenderDialogs();
 
-        // Render
         ImGui::Render();
-        
+
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        
+
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        // Update and render additional platform windows
         if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
             GLFWwindow* backup_current_context = glfwGetCurrentContext();
             ImGui::UpdatePlatformWindows();
@@ -748,18 +1166,14 @@ int main() {
         glfwSwapBuffers(window);
     }
 
-    // Save before exit
-    if (g_appState.needsSave) {
-        SaveNotes();
-    }
+    SaveRecentFiles();
 
-    // Cleanup
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
-    
+
     glfwDestroyWindow(window);
     glfwTerminate();
-    
+
     return 0;
 }

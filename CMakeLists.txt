@@ -13,13 +13,17 @@ set(IMGUI_SRC
     resources/imgui/backends/imgui_impl_glfw.cpp
     resources/imgui/backends/imgui_impl_opengl3.cpp
 )
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+
 
 add_executable(notifier main.cpp ${IMGUI_SRC})
-
 target_include_directories(notifier PRIVATE ${CMAKE_SOURCE_DIR}/resources/imgui 
-    ${CMAKE_SOURCE_DIR}/resources/imgui/backends)
+    ${CMAKE_SOURCE_DIR}/resources/imgui/backends ${GTK3_INCLUDE_DIRS})
 
 find_package(glfw3 REQUIRED)
 find_package(OpenGL REQUIRED)
 
-target_link_libraries(notifier PRIVATE glfw OpenGL::GL)
+
+target_compile_options(notifier PRIVATE ${GTK3_CFLAGS_OTHER})
+target_link_libraries(notifier PRIVATE glfw OpenGL::GL ${GTK3_LIBRARIES})

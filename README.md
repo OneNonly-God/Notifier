@@ -1,6 +1,6 @@
-# Notifier — A Notes Application
+# Notifier — A Text Editor Application
 
-A lightweight, dockable, cross-platform notes application built with **C++**, **Dear ImGui (docking branch)**, and **GLFW/OpenGL**. Designed for fast note-taking, searching, and quick editing. This repository contains the core app (Notifier v1.0), with a polished UI, keyboard shortcuts, dockable panels, and persistent layout and notes storage.
+A lightweight, dockable, cross-platform editor application built with **C++**, **Dear ImGui (docking branch)**, and **GLFW/OpenGL**. Designed for quick editing. This repository contains the core app (Notifier v1.0), with a polished UI, keyboard shortcuts, dockable panels, and persistent layout.
 
 I suggest you to overwrite the imgui.ini layout file in your own build directory with the layout provided in the resources directory if docking is weird for you **(This is optional)**.
 
@@ -11,11 +11,9 @@ I suggest you to overwrite the imgui.ini layout file in your own build directory
 ## Features
 
 * Dockable UI using Dear ImGui docking branch (tabs, split panels)
-* Left resizable **Notes List** (searchable, selectable, context menu)
 * Center **Editor** with multiline editing and simple stats (words/characters)
 * Bottom **New Note** panel for quick creation
 * Keyboard shortcuts: `Ctrl+N`, `Ctrl+S`, `F5`, `Del`, `Esc`
-* Persistent notes saved to `notes.txt` (with a per-note delimiter for multiline notes)
 * Persistent ImGui dock/layout state (via ImGui `.ini` file)
 * Theme support: Dark / Light / Custom (customizable colors)
 * Context menus, confirmation dialogs, and modest UX polish
@@ -39,7 +37,7 @@ Custom Theme by default
 
 ## Quick Start (Linux Mint / Ubuntu)
 
-(Windows instructions not included — I mainly use Linux, and my PC can’t currently handle a Windows build.I'm sure it will work on windows with a few adjustments PRs welcome!)
+(Windows instructions not included — I mainly use Linux, and my PC can’t currently handle a Windows build.I'm sure it will work on windows with a few adjustments, **PRs welcome!**).
 
 ### Install build dependencies
 
@@ -82,40 +80,14 @@ make -j$(nproc)
 * `imgui/` (external) — Dear ImGui (docking branch) and backends (or use submodule)
 * `backends/` — `imgui_impl_glfw.cpp`, `imgui_impl_opengl3.cpp` (from ImGui examples)
 * `fonts/` — optional custom fonts (e.g. `EpundaSans-Light.ttf`)
-* `notes.txt` — user notes stored (created at runtime)
-* `notifier_layout.ini` (optional) — saved ImGui layout file (if configured)
-
----
-
-## Notes storage format
-
-Notes are stored in a simple text format where each note is a block of text, separated by a delimiter line:
-
-```
-<note text (can contain newlines)>
---------------
-<next note text>
---------------
-```
 
 ---
 
 ## Important Implementations left to add
 
-### 1. Docking and layout persistence
-
-* Use the docking branch of Dear ImGui for `DockBuilder*` APIs and `ImGui::DockSpace` features.
-* Set a custom ImGui ini filename to persist layout in a controlled place:
-
-```cpp
-ImGui::CreateContext();
-ImGuiIO& io = ImGui::GetIO();
-io.IniFilename = "notifier_layout.ini"; // or full path in config dir
-```
-
 * Initialize your dockspace as a fullscreen parent window and call `DockBuilder` only on first run (or when no layout exists) so that user rearrangements are preserved on next start.
 
-### 2. Fonts
+### 1. Fonts
 
 Load a custom font (if present), and fall back to `AddFontDefault()` otherwise. Example:
 
@@ -136,11 +108,7 @@ if (isspace((unsigned char)ch)) { ... }
 
 ### 4. Large text buffers vs. `std::string`
 
-The app uses fixed-size char buffers (8k) for `InputTextMultiline`. This works, but you may later switch to `std::string` + `InputText` callback for dynamic resizing.
-
-### 5. Config directory
-
-I am considering saving `notes.txt` and the layout `.ini` to an OS config directory rather than the working directory (e.g. `$XDG_CONFIG_HOME/notifier/` or `~/.config/notifier/`).By using `std::filesystem` to create directories.
+The app uses fixed-size char buffers (8k) for `InputTextMultiline`. This works, but may later switch to `std::string` + `InputText` callback for dynamic resizing.
 
 ---
 
@@ -178,9 +146,8 @@ I am considering saving `notes.txt` and the layout `.ini` to an OS config direct
 
 Contributions, PRs, and suggestions are welcome. If you add features, please:
 
-* Keep ImGui usage idiomatic and avoid heavy per-frame allocations
-* Respect the existing `notes.txt` delimiter format (or migrate to JSON with a clear migration path)
-* Add tests for parsing and saving notes if you add more complex storage formats
+* Keep ImGui usage idiomatic and avoid heavy per-frame allocations.
+* Add tests for parsing and saving notes if you add more complex storage formats.
 * Feel free to tinker and suggest ideas or improvements to me, would mean a lot.
 
 ---
