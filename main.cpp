@@ -1,7 +1,10 @@
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_opengl3.h"
+#include "icon.h"
 #include <GLFW/glfw3.h>
 
 #include <iostream>
@@ -106,6 +109,19 @@ static int ImGuiStringInputCallback(ImGuiInputTextCallbackData* data)
         data->Buf = str->data();
     }
     return 0;
+}
+
+// Embedded Icon
+void setEmbeddedIcon(GLFWwindow* window) {
+    GLFWimage icon;
+    icon.pixels = stbi_load_from_memory(icon_png, icon_png_len, &icon.width, &icon.height, nullptr, 4);
+    if (!icon.pixels) {
+        std::cerr << "Failed to load embedded icon." << std::endl;
+        return;
+    }
+
+    glfwSetWindowIcon(window, 1, &icon);
+    stbi_image_free(icon.pixels);
 }
 
 // -----------------------------
@@ -1116,6 +1132,7 @@ int main() {
         glfwTerminate();
         return -1;
     }
+    setEmbeddedIcon(window);
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Enable vsync

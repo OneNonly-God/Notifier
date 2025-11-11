@@ -16,4 +16,4 @@ echo ">>> Building project..."
 make -j$(nproc)
 
 echo ">>> Build complete! Running the application..."
-./notifier
+./Notifier

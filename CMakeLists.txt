@@ -1,10 +1,15 @@
 cmake_minimum_required(VERSION 3.10)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-project(NotesApp)
-
+project(Notifier)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ImGui source files
+# --- Find dependencies ---
+find_package(OpenGL REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+find_package(glfw3 REQUIRED)
+
+# --- ImGui source files ---
 set(IMGUI_SRC
     resources/imgui/imgui.cpp
     resources/imgui/imgui_draw.cpp
@@ -13,17 +18,28 @@ set(IMGUI_SRC
     resources/imgui/backends/imgui_impl_glfw.cpp
     resources/imgui/backends/imgui_impl_opengl3.cpp
 )
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
 
+# --- Executable ---
+add_executable(${PROJECT_NAME}
+    main.cpp
+    ${CMAKE_SOURCE_DIR}/resources/icon.h
+    ${IMGUI_SRC}
+)
 
-add_executable(notifier main.cpp ${IMGUI_SRC})
-target_include_directories(notifier PRIVATE ${CMAKE_SOURCE_DIR}/resources/imgui 
-    ${CMAKE_SOURCE_DIR}/resources/imgui/backends ${GTK3_INCLUDE_DIRS})
+# --- Include directories ---
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_SOURCE_DIR}/resources/imgui
+    ${CMAKE_SOURCE_DIR}/resources/imgui/backends
+    ${CMAKE_SOURCE_DIR}/resources/
+    ${GTK3_INCLUDE_DIRS}
+)
 
-find_package(glfw3 REQUIRED)
-find_package(OpenGL REQUIRED)
+# --- Compiler flags from pkg-config ---
+target_compile_options(${PROJECT_NAME} PRIVATE ${GTK3_CFLAGS_OTHER})
 
-
-target_compile_options(notifier PRIVATE ${GTK3_CFLAGS_OTHER})
-target_link_libraries(notifier PRIVATE glfw OpenGL::GL ${GTK3_LIBRARIES})
+# --- Link libraries ---
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    glfw
+    OpenGL::GL
+    ${GTK3_LIBRARIES}
+)
