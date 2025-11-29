@@ -36,12 +36,14 @@ ThemeType currentTheme = THEME_CUSTOM;
 
 // A single open file / tab representation
 struct FileTab {
-    std::string filePath; // empty => unsaved new file
-    std::string content;  // live editable buffer (std::string)
-    std::vector<char> editBuffer; // safe editing buffer for ImGui
+    std::string filePath;
+    std::string content;
+    std::vector<char> editBuffer;
     bool isModified = false;
     std::filesystem::file_time_type lastModified;
     bool isReadonly = false;
+    int cachedWordCount = 0;
+    size_t cachedCharCount = 0;
 };
 
 struct AppState {
@@ -68,11 +70,15 @@ struct AppState {
     // Recent files
     std::vector<std::string> recentFiles;
     const size_t maxRecentFiles = 10;
+    std::string projectRoot;
 };
 
 AppState g_appState;
 
 // Forward declarations
+void RenderExplorer();
+void RenderFileSystemTree(const fs::path& path);
+void OpenFolder(const std::string& folderpath);
 void SetupCustomStyle();
 void HandleKeyboardShortcuts();
 void SetupInitialDockingLayout();
@@ -114,9 +120,27 @@ void gtkCleanup() {
     #endif
 }
 
-// -----------------------------
-// Platform file dialogs
-// -----------------------------
+
+void OpenFolder(const std::string& folderpath) {
+    if (folderpath.empty()) return;
+    
+    // Basic Validation
+    if (!fs::exists(folderpath) || !fs::is_directory(folderpath)) {
+        std::cerr << "Invalid folder path: " << folderpath << "\n";
+        return;
+    }
+
+    // Update State
+    g_appState.projectRoot = folderpath;
+    g_appState.currentPath = folderpath; // Update fallback browser path too
+
+    // Bring Explorer to focus to show the user it changed
+    // We can't easily force focus a dock window without internal imgui pointers, 
+    // but we can ensure the variable is set.
+    // ImGui::TextColored(ImVec4(0.6f, 0.4f, 0.8f, 0.1f), "Opened Folder: %s", folderpath.c_str());
+    // std::cout << "Opened Folder: " << folderpath << "\n";
+}
+
 std::string OpenFileDialog() {
 #ifdef _WIN32
     char filename[MAX_PATH] = "";
@@ -222,6 +246,201 @@ std::string SaveFileDialog(const std::string& defaultName = "") {
     return "";
 }
 
+std::string OpenFolderDialog() {
+#ifdef _WIN32
+    std::string result = "";
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    
+    if (FAILED(hr)) {
+        std::cerr << "CoInitializeEx failed\n";
+        return "";
+    }
+    
+    IFileOpenDialog* pFileOpen = nullptr;
+    // Create the FileOpenDialog object.
+    hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_ALL, 
+                          IID_IFileOpenDialog, reinterpret_cast<void**>(&pFileOpen));
+
+    if (SUCCEEDED(hr) && pFileOpen != nullptr) {
+        // Set options to pick folders
+        DWORD dwOptions;
+        if (SUCCEEDED(pFileOpen->GetOptions(&dwOptions))) {
+            pFileOpen->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        }
+
+        // Show the dialog
+        hr = pFileOpen->Show(NULL);
+
+        // Get the result
+        if (SUCCEEDED(hr)) {
+            IShellItem* pItem = nullptr;
+            hr = pFileOpen->GetResult(&pItem);
+            if (SUCCEEDED(hr) && pItem != nullptr) {
+                PWSTR pszFilePath = nullptr;
+                hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszFilePath);
+
+                // Convert WCHAR (Wide) to std::string
+                if (SUCCEEDED(hr) && pszFilePath != nullptr) {
+                    int size_needed = WideCharToMultiByte(CP_UTF8, 0, pszFilePath, -1, NULL, 0, NULL, NULL);
+                    std::string strTo(size_needed, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, pszFilePath, -1, &strTo[0], size_needed, NULL, NULL);
+                    
+                    // Remove null terminator added by string resize
+                    if (!strTo.empty() && strTo.back() == '\0') strTo.pop_back();
+                    
+                    result = strTo;
+                    CoTaskMemFree(pszFilePath);
+                }
+                pItem->Release();
+            }
+        }
+        pFileOpen->Release();
+    } else {
+        std::cerr << "Failed to create FileOpenDialog\n";
+    }
+    CoUninitialize();
+    return result;
+    
+#elif __linux__
+    if (!gtk_init_check(NULL, NULL)) return "";
+    GtkWidget *dialog = gtk_file_chooser_dialog_new("Open Folder", NULL, GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    std::string result;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        result = std::string(filename);
+        g_free(filename);
+    }
+    gtk_widget_destroy(dialog);
+    gtkCleanup();
+    return result;
+#else
+    // Fallback: Use ImGui file browser
+    g_appState.showFileDialog = true;
+    return "";
+#endif
+    return "";
+}
+
+void RenderFileSystemTree(const fs::path& path) {
+    std::vector<fs::directory_entry> directories;
+    std::vector<fs::directory_entry> files;
+
+    try {
+        for (const auto& entry : fs::directory_iterator(path)) {
+            // Skip hidden files/folders
+            if (entry.path().filename().string().rfind(".", 0) == 0) continue;
+
+            try {
+                if (entry.is_directory()) {
+                    directories.push_back(entry);
+                } else {
+                    files.push_back(entry);
+                }
+            } catch (const fs::filesystem_error& e) {
+                std::cerr << "Error accessing entry: " << e.what() << "\n";
+                continue;
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        std::cerr << "Error reading directory " << path << ": " << e.what() << "\n";
+        return;
+    } catch (const std::exception& e) {
+        std::cerr << "Unexpected error in file tree: " << e.what() << "\n";
+        return;
+    }
+
+    // Sort alphabetically
+    auto sortFunc = [](const fs::directory_entry& a, const fs::directory_entry& b) {
+        return a.path().filename().string() < b.path().filename().string();
+    };
+    std::sort(directories.begin(), directories.end(), sortFunc);
+    std::sort(files.begin(), files.end(), sortFunc);
+
+    // Render directories
+    for (const auto& dir : directories) {
+        std::string dirname = dir.path().filename().string();
+        std::string pathStr = dir.path().string();
+
+        // Use PushID with the full path to ensure uniqueness without hash collisions
+        ImGui::PushID(pathStr.c_str()); 
+        
+        bool nodeOpen = ImGui::TreeNodeEx(dirname.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
+        
+        // Context Menu for folders
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem("Set as Root")) {
+                OpenFolder(pathStr);
+            }
+            ImGui::EndPopup();
+        }
+
+        if (nodeOpen) {
+            RenderFileSystemTree(dir.path());
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+
+    // Render files
+    for (const auto& file : files) {
+        std::string filename = file.path().filename().string();
+        std::string pathStr = file.path().string();
+
+        bool isSelected = false;
+        if (g_appState.activeTab >= 0 && g_appState.activeTab < g_appState.tabs.size()) {
+            if (g_appState.tabs[g_appState.activeTab].filePath == pathStr) {
+                isSelected = true;
+            }
+        }
+
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (isSelected) flags |= ImGuiTreeNodeFlags_Selected;
+
+        ImGui::PushID(pathStr.c_str()); // Unique ID based on full path
+        
+        ImGui::TreeNodeEx(filename.c_str(), flags);
+        if (ImGui::IsItemClicked() || ImGui::IsItemActivated()) {
+            OpenFile(pathStr);
+        }
+        
+        ImGui::PopID();
+    }
+}
+
+void RenderExplorer() {
+    ImGui::Begin("Explorer");
+
+    if (g_appState.projectRoot.empty()) {
+        ImVec2 size = ImGui::GetContentRegionAvail();
+        ImGui::SetCursorPos(ImVec2(size.x * 0.1f, size.y * 0.4f));
+        
+        if (ImGui::Button("Open Folder", ImVec2(size.x * 0.8f, 0))) {
+            std::string folder = OpenFolderDialog();
+            if (!folder.empty()) {
+                g_appState.projectRoot = folder;
+            }
+        }
+    } else {
+        // Header with project name and close button
+        std::string rootName = fs::path(g_appState.projectRoot).filename().string();
+        ImGui::TextColored(ImVec4(0.6f, 0.4f, 0.8f, 1.0f), "PROJECT: %s", rootName.c_str());
+        
+        ImGui::SameLine(ImGui::GetWindowWidth() - 30);
+        if (ImGui::SmallButton("X")) {
+            g_appState.projectRoot.clear();
+        }
+        
+        ImGui::Separator();
+        
+        // Start the recursive tree
+        ImGui::BeginChild("FileTree");
+        RenderFileSystemTree(g_appState.projectRoot);
+        ImGui::EndChild();
+    }
+
+    ImGui::End();
+}
+
 bool IsTextFile(const std::string& filepath) {
     if (filepath.empty() || !fs::exists(filepath)) return false;
     
@@ -289,7 +508,6 @@ std::string ReadFileContent(const std::string& filepath) {
     std::string content((size_t)size, '\0');
     file.read(&content[0], size);
 
-    // Normalize CRLF -> LF
     std::string normalized;
     normalized.reserve(content.size());
     for (size_t i = 0; i < content.size(); ++i) {
@@ -348,6 +566,7 @@ void SaveRecentFiles() {
         file << path << "\n";
     }
 }
+
 
 void SaveFile(int tabIndex) {
     if (tabIndex < 0 || tabIndex >= (int)g_appState.tabs.size()) {
@@ -422,6 +641,22 @@ void SaveAll() {
     }
 }
 
+// Helper function to safely update file stats
+void UpdateFileStats(FileTab& tab) {
+    tab.cachedCharCount = tab.content.length();
+    int wc = 0;
+    bool inword = false;
+    for(char c : tab.content) {
+        if(std::isspace(static_cast<unsigned char>(c))) {
+            inword = false;
+        } else if(!inword) {
+            inword = true;
+            ++wc;
+        }
+    }
+    tab.cachedWordCount = wc;
+}
+
 
 void OpenFile(const std::string& filepath) {
     if (filepath.empty()) return;
@@ -451,6 +686,7 @@ void OpenFile(const std::string& filepath) {
     tab.lastModified = fs::last_write_time(filepath);
     tab.isReadonly = false;
     tab.isModified = false;
+    UpdateFileStats(tab);
 
     g_appState.tabs.push_back(std::move(tab));
     g_appState.activeTab = (int)g_appState.tabs.size() - 1;
@@ -568,7 +804,13 @@ void HandleKeyboardShortcuts() {
     // but allow Escape to work in popups
     if (io.WantTextInput && !ImGui::IsPopupOpen(ImGuiID(0), ImGuiPopupFlags_AnyPopup)) return;
 
-    // Ctrl+O - Open
+    // Ctrl+F - Open Folder
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+        std::string folderpath = OpenFolderDialog();
+        if (!folderpath.empty()) OpenFolder(folderpath);
+    }
+    
+    // Ctrl+O - Open Files
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
         std::string filepath = OpenFileDialog();
         if (!filepath.empty()) OpenFile(filepath);
@@ -627,11 +869,15 @@ void SetupInitialDockingLayout() {
         ImGui::DockBuilderRemoveNode(dockspace_id);
         ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->WorkSize);
-
+        
+        ImGuiID dock_main_id = dockspace_id;
         ImGuiID dock_left, dock_right;
-        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.20f, &dock_left, &dock_right);
+        // Uhh I decided to split 20% left (explorer), 80% right (remaining) idk might change later
+        ImGui::DockBuilderSplitNode(dock_main_id, ImGuiDir_Left, 0.20f, &dock_left, &dock_right);
 
-        ImGui::DockBuilderDockWindow("Files", dock_left);
+        // Split the right side Top (Files/Tabs), Bottom (Editor)
+        ImGui::DockBuilderDockWindow("Explorer", dock_left);
+        ImGui::DockBuilderDockWindow("Files", dock_right);
         ImGui::DockBuilderDockWindow("Editor", dock_right);
 
         ImGui::DockBuilderFinish(dockspace_id);
@@ -670,6 +916,12 @@ void RenderMainDockSpace() {
 void RenderMenuBar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Open Folder", "Ctrl+F")) {
+                std::string folder = OpenFolderDialog();
+                if (!folder.empty()) {
+                    OpenFolder(folder);
+                }
+            }
             if (ImGui::MenuItem("Open File", "Ctrl+O")) {
                 std::string path = OpenFileDialog();
                 if (!path.empty()) OpenFile(path);
@@ -831,12 +1083,18 @@ void RenderEditor() {
         }
 
         // Initialize edit buffer from content if needed
-        if (tab.editBuffer.empty() || tab.editBuffer.size() < tab.content.size() + 1) {
+        // Reserve capacity FIRST to avoid reallocation during insert
+        const size_t requiredCapacity = std::max(tab.content.size() * 2 + 1, size_t(4096));
+        if (tab.editBuffer.capacity() < requiredCapacity) {
+            tab.editBuffer.clear();
+            tab.editBuffer.reserve(requiredCapacity);
+            tab.editBuffer.insert(tab.editBuffer.begin(), tab.content.begin(), tab.content.end());
+            tab.editBuffer.push_back('\0');
+        } else if (tab.editBuffer.size() < tab.content.size() + 1) {
+            // Content changed but buffer has enough capacity
             tab.editBuffer.clear();
             tab.editBuffer.insert(tab.editBuffer.begin(), tab.content.begin(), tab.content.end());
             tab.editBuffer.push_back('\0');
-            // Reserve extra space to avoid constant reallocations
-            tab.editBuffer.reserve(tab.editBuffer.size() * 2);
         }
 
         ImGuiInputTextFlags flags = 
@@ -856,6 +1114,19 @@ void RenderEditor() {
                 tab.content = newContent;
                 tab.isModified = true;
                 g_appState.needsSave = true;
+                
+                tab.cachedCharCount = tab.content.length();
+                int wordCount = 0;
+                bool inWord = false;
+                for (char c : tab.content) {
+                    if (std::isspace(static_cast<unsigned char>(c))) {
+                        inWord = false;
+                    } else if (!inWord) {
+                        inWord = true;
+                        ++wordCount;
+                    }
+                }
+                tab.cachedWordCount = wordCount;
             }
         }
 
@@ -874,29 +1145,20 @@ void RenderEditor() {
                 tab.content = ReadFileContent(tab.filePath);
                 tab.lastModified = fs::last_write_time(tab.filePath);
                 tab.isModified = false;
+                tab.editBuffer.clear(); // Clear buffer to force reinit
+                UpdateFileStats(tab);
             } else {
                 tab.content.clear();
                 tab.isModified = false;
+                tab.editBuffer.clear();
+                UpdateFileStats(tab);
             }
         }
 
         ImGui::SameLine();
         
-        // Better stats calculation
-        size_t charCount = tab.content.length();
-        int wordCount = 0;
-        bool inWord = false;
-        
-        for (char c : tab.content) {
-            if (std::isspace(static_cast<unsigned char>(c))) {
-                inWord = false;
-            } else if (!inWord) {
-                inWord = true;
-                ++wordCount;
-            }
-        }
-
-        ImGui::Text("Words: %d | Characters: %zu", wordCount, charCount);
+        // Use cached stats for performance (already calculated on content change)
+        ImGui::Text("Words: %d | Characters: %zu", tab.cachedWordCount, tab.cachedCharCount);
 
     } else {
         ImVec2 windowSize = ImGui::GetWindowSize();
@@ -1036,7 +1298,7 @@ void RenderDialogs() {
         ImGui::Text("Notifier - File Editor");
         ImGui::Separator();
 
-        ImGui::Text("Version: 1.0.1 (Fixed)");
+        ImGui::Text("Version: 1.0.1");
         ImGui::Text("Built with C++ and Dear ImGui");
         ImGui::Separator();
         
@@ -1053,6 +1315,7 @@ void RenderDialogs() {
         
         ImGui::Separator();
         ImGui::Text("Keyboard Shortcuts:");
+        ImGui::BulletText("Ctrl+F: Open folders");
         ImGui::BulletText("Ctrl+O: Open file");
         ImGui::BulletText("Ctrl+N: New file");
         ImGui::BulletText("Ctrl+S: Save");
@@ -1146,6 +1409,7 @@ int main() {
         RenderMenuBar();
         RenderTabs();
         RenderEditor();
+        RenderExplorer();
         RenderDialogs();
 
         ImGui::Render();
