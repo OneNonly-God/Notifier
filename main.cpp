@@ -26,8 +26,7 @@
 #include <shlobj.h>
 #elif __linux__
 #include <gtk/gtk.h>
-#elif __APPLE__
-// macOS specific headers would go here
+// Removed the idea for macos since i dont wanna do it
 #endif
 
 namespace fs = std::filesystem;
@@ -39,6 +38,7 @@ ThemeType currentTheme = THEME_CUSTOM;
 struct FileTab {
     std::string filePath; // empty => unsaved new file
     std::string content;  // live editable buffer (std::string)
+    std::vector<char> editBuffer; // safe editing buffer for ImGui
     bool isModified = false;
     std::filesystem::file_time_type lastModified;
     bool isReadonly = false;
@@ -92,25 +92,6 @@ void RenderMainDockSpace();
 bool IsTextFile(const std::string& filepath);
 std::string ReadFileContent(const std::string& filepath);
 
-// -----------------------------
-// ImGui helper: Callback resize - FIXED
-// -----------------------------
-static int ImGuiStringInputCallback(ImGuiInputTextCallbackData* data)
-{
-    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize)
-    {
-        std::string* str = (std::string*)data->UserData;
-        IM_ASSERT(str != nullptr);
-        
-        // Resize string to accommodate new content
-        str->resize((size_t)data->BufTextLen);
-        
-        // CRITICAL FIX: Use data() instead of c_str() for non-const access
-        data->Buf = str->data();
-    }
-    return 0;
-}
-
 // Embedded Icon
 void setEmbeddedIcon(GLFWwindow* window) {
     GLFWimage icon;
@@ -122,6 +103,15 @@ void setEmbeddedIcon(GLFWwindow* window) {
 
     glfwSetWindowIcon(window, 1, &icon);
     stbi_image_free(icon.pixels);
+}
+
+// Clean up GTK resources
+void gtkCleanup() {
+    #ifdef __linux__
+    while (gtk_events_pending()) {
+        gtk_main_iteration();
+    }
+    #endif
 }
 
 // -----------------------------
@@ -164,9 +154,7 @@ std::string OpenFileDialog() {
     }
 
     gtk_widget_destroy(dialog);
-    while (gtk_events_pending()) {
-        gtk_main_iteration();
-    }
+    gtkCleanup();
 
     return result;
 #else
@@ -224,9 +212,7 @@ std::string SaveFileDialog(const std::string& defaultName = "") {
     }
 
     gtk_widget_destroy(dialog);
-    while (gtk_events_pending()) {
-        gtk_main_iteration();
-    }
+    gtkCleanup();
 
     return result;
 #else
@@ -236,9 +222,6 @@ std::string SaveFileDialog(const std::string& defaultName = "") {
     return "";
 }
 
-// -----------------------------
-// File helpers - IMPROVED
-// -----------------------------
 bool IsTextFile(const std::string& filepath) {
     if (filepath.empty() || !fs::exists(filepath)) return false;
     
@@ -325,9 +308,6 @@ std::string ReadFileContent(const std::string& filepath) {
     return normalized;
 }
 
-// -----------------------------
-// Recent files - IMPROVED
-// -----------------------------
 void AddToRecentFiles(const std::string& filepath) {
     if (filepath.empty()) return;
     
@@ -369,9 +349,6 @@ void SaveRecentFiles() {
     }
 }
 
-// -----------------------------
-// Save/Load tab file operations - IMPROVED
-// -----------------------------
 void SaveFile(int tabIndex) {
     if (tabIndex < 0 || tabIndex >= (int)g_appState.tabs.size()) {
         std::cerr << "Invalid tab index: " << tabIndex << "\n";
@@ -445,9 +422,7 @@ void SaveAll() {
     }
 }
 
-// -----------------------------
-// Tab and editor management - IMPROVED
-// -----------------------------
+
 void OpenFile(const std::string& filepath) {
     if (filepath.empty()) return;
     
@@ -586,14 +561,12 @@ void SetupCustomStyle() {
     colors[ImGuiCol_TextSelectedBg]       = ImVec4(0.20f, 0.10f, 0.32f, 0.90f);
 }
 
-// -----------------------------
-// Keyboard shortcuts - IMPROVED
-// -----------------------------
 void HandleKeyboardShortcuts() {
     ImGuiIO& io = ImGui::GetIO();
 
-    // Only process shortcuts when not typing in text fields
-    if (io.WantTextInput) return;
+    // Only process shortcuts when not typing in regular text fields
+    // but allow Escape to work in popups
+    if (io.WantTextInput && !ImGui::IsPopupOpen(ImGuiID(0), ImGuiPopupFlags_AnyPopup)) return;
 
     // Ctrl+O - Open
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
@@ -646,9 +619,7 @@ void HandleKeyboardShortcuts() {
     }
 }
 
-// -----------------------------
-// Docking layout & main dockspace
-// -----------------------------
+
 void SetupInitialDockingLayout() {
     ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
 
@@ -696,9 +667,6 @@ void RenderMainDockSpace() {
     ImGui::End();
 }
 
-// -----------------------------
-// Menu bar
-// -----------------------------
 void RenderMenuBar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
@@ -784,9 +752,7 @@ void RenderMenuBar() {
     }
 }
 
-// -----------------------------
-// Tabs view (files list) - IMPROVED
-// -----------------------------
+
 void RenderTabs() {
     ImGui::Begin("Files");
 
@@ -842,9 +808,6 @@ void RenderTabs() {
     ImGui::End();
 }
 
-// -----------------------------
-// Editor panel - FIXED
-// -----------------------------
 void RenderEditor() {
     ImGui::Begin("Editor");
 
@@ -867,32 +830,33 @@ void RenderEditor() {
             g_appState.focusEditor = false;
         }
 
-        // CRITICAL FIX: Ensure string has capacity for editing
-        // Reserve extra space for the buffer
-        const size_t minCapacity = 1024;
-        if (tab.content.capacity() < minCapacity) {
-            tab.content.reserve(minCapacity);
+        // Initialize edit buffer from content if needed
+        if (tab.editBuffer.empty() || tab.editBuffer.size() < tab.content.size() + 1) {
+            tab.editBuffer.clear();
+            tab.editBuffer.insert(tab.editBuffer.begin(), tab.content.begin(), tab.content.end());
+            tab.editBuffer.push_back('\0');
+            // Reserve extra space to avoid constant reallocations
+            tab.editBuffer.reserve(tab.editBuffer.size() * 2);
         }
 
-        std::vector<char> buf(tab.content.begin(), tab.content.end());
-
         ImGuiInputTextFlags flags = 
-            ImGuiInputTextFlags_AllowTabInput | 
-            ImGuiInputTextFlags_CallbackResize;
+            ImGuiInputTextFlags_AllowTabInput;
 
-        // CRITICAL FIX: Use data() instead of c_str() for mutable access
-        // The buffer size should be current size + extra room
+        // Safe buffer management: use local editing buffer
         if (ImGui::InputTextMultiline(
                 "##editor",
-                tab.content.data(),
-                tab.content.capacity() + 1,
+                tab.editBuffer.data(),
+                tab.editBuffer.capacity(),
                 availSize,
-                flags,
-                ImGuiStringInputCallback,
-                (void*)&tab.content))
+                flags))
         {
-            tab.isModified = true;
-            g_appState.needsSave = true;
+            // Sync edited buffer back to content
+            std::string newContent(tab.editBuffer.data());
+            if (newContent != tab.content) {
+                tab.content = newContent;
+                tab.isModified = true;
+                g_appState.needsSave = true;
+            }
         }
 
         ImGui::Separator();
@@ -918,7 +882,7 @@ void RenderEditor() {
 
         ImGui::SameLine();
         
-        // IMPROVED: Better stats calculation
+        // Better stats calculation
         size_t charCount = tab.content.length();
         int wordCount = 0;
         bool inWord = false;
@@ -960,9 +924,7 @@ void RenderEditor() {
     ImGui::End();
 }
 
-// -----------------------------
-// Simple ImGui file browser (fallback)
-// -----------------------------
+
 void RenderSimpleFileBrowser() {
     if (!g_appState.showFileDialog) return;
 
@@ -1026,9 +988,6 @@ void RenderSimpleFileBrowser() {
     }
 }
 
-// -----------------------------
-// Dialogs - IMPROVED
-// -----------------------------
 void RenderDialogs() {
     // Close tab confirmation
     if (g_appState.closeTabIndex >= 0) {
@@ -1113,9 +1072,7 @@ void RenderDialogs() {
     RenderSimpleFileBrowser();
 }
 
-// -----------------------------
-// main
-// -----------------------------
+
 int main() {
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW\n";
@@ -1219,6 +1176,8 @@ int main() {
 
     glfwDestroyWindow(window);
     glfwTerminate();
+    
+    gtkCleanup();
 
     return 0;
 }
