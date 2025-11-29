@@ -1,18 +1,16 @@
 # Notifier — A Text Editor Application
 
-A lightweight, dockable, cross-platform editor application built with **C++**, **Dear ImGui (docking branch)**, and **GLFW/OpenGL**. Designed for quick editing. This repository contains the core app (Notifier v1.0), with a polished UI, keyboard shortcuts, dockable panels, and persistent layout.
+A lightweight, dockable, cross-platform editor application built with **C++**, **Dear ImGui (docking branch)**, **GLFW/OpenGL** and **stb/stb_image**. Designed for quick editing. This repository contains the core app (Notifier v1.0.x), with a polished UI, keyboard shortcuts, dockable panels, and persistent layout.
 
 I suggest you to overwrite the imgui.ini layout file in your own build directory with the layout provided in the resources directory if docking is weird for you **(This is optional)**.
 
-> **Status:** Working — feature-complete for core functionality. Theme/background improvements planned (see Roadmap).
-
+> **Status:** Working — feature-complete for core functionality. Improvements and extra features planned
 ---
 
 ## Features
 
 * Dockable UI using Dear ImGui docking branch (tabs, split panels)
 * Center **Editor** with multiline editing and simple stats (words/characters)
-* Bottom **New Note** panel for quick creation
 * Keyboard shortcuts: `Ctrl+N`, `Ctrl+S`, `F5`, `Del`, `Esc`
 * Persistent ImGui dock/layout state (via ImGui `.ini` file)
 * Theme support: Dark / Light / Custom (customizable colors)
@@ -83,52 +81,10 @@ make -j$(nproc)
 
 ---
 
-## Important Implementations left to add
+## Implementations adding list
 
-* Initialize your dockspace as a fullscreen parent window and call `DockBuilder` only on first run (or when no layout exists) so that user rearrangements are preserved on next start.
-
-### 1. Fonts
-
-Load a custom font (if present), and fall back to `AddFontDefault()` otherwise. Example:
-
-```cpp
-if (std::filesystem::exists(fontPath)) {
-    ImFont* mainFont = io.Fonts->AddFontFromFileTTF(fontPath, 16.0f);
-    io.FontDefault = mainFont;
-}
-```
-
-### 3. Input safety
-
-When using `isspace()` or other `ctype.h` functions, cast the argument to `unsigned char` to avoid UB with negative `char` values:
-
-```cpp
-if (isspace((unsigned char)ch)) { ... }
-```
-
-### 4. Large text buffers vs. `std::string`
-
-The app uses fixed-size char buffers (8k) for `InputTextMultiline`. This works, but may later switch to `std::string` + `InputText` callback for dynamic resizing.
-
----
-
-## UX & Visual Improvements (Roadmap)
-
-### What I plan to add maybe someday
-
-* **Static background image** + subtle gradient tint and vignette.
-* **Parallax** based on mouse position for depth.
-* Use a **soft radial vignette mask** to focus the UI center.
-
-### Medium
-
-* **Animated gradient** (slow color shifts) for a living UI.
-* **Pre-blurred background** for glassmorphism (cheap approach).
-
-### Advanced
-
-* **Runtime Gaussian blur** (FBO + separable blur shader) to blur the area behind panels.
-* **Particles / bokeh** subtle motion for polish.
+### 1. Find files, text, etc.
+I plan to add this in the near future
 
 ---
 
@@ -157,5 +113,6 @@ Contributions, PRs, and suggestions are welcome. If you add features, please:
 * This project builds on:
 
   * [Dear ImGui](https://github.com/ocornut/imgui) (docking branch) — MIT-style license
-  * [GLFW](https://www.glfw.org/) — zlib/libpng license
+  * [GLFW](https://github.com/glfw/glfw) — zlib/libpng license
+  * [STB_IMAGE](https://github.com/nothings/stb/blob/master/stb_image.h) — MIT-style license
 ---
